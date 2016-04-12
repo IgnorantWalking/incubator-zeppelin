@@ -5,6 +5,8 @@ permalink: /:categories/:year/:month/:day/:title
 exclude: [".rvmrc", ".rbenv-version", "README.md", "Rakefile", "changelog.md", "vendor", "node_modules", "scss"]
 pygments: true
 markdown: redcarpet
+redcarpet:
+  extensions: ["tables"]
 encoding: utf-8
 
 # Themes are encouraged to use these universal variables 
@@ -18,6 +20,8 @@ author :
   github : apache
   twitter : ASF
   feedburner : feedname
+
+ZEPPELIN_VERSION : 0.6.0-incubating-SNAPSHOT
 
 # The production_url is only used when full-domain names are needed
 # such as sitemap.txt 

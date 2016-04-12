@@ -23,6 +23,7 @@ import java.sql.ResultSet;
 import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -73,8 +74,10 @@ public class HiveInterpreter extends Interpreter {
   static final String DEFAULT_PASSWORD = DEFAULT_KEY + DOT + PASSWORD_KEY;
 
   private final HashMap<String, Properties> propertiesMap;
-  private final Map<String, Connection> keyConnectionMap;
   private final Map<String, Statement> paragraphIdStatementMap;
+
+  private final Map<String, ArrayList<Connection>> propertyKeyUnusedConnectionListMap;
+  private final Map<String, Connection> paragraphIdConnectionMap;
 
   static {
     Interpreter.register(
@@ -92,8 +95,9 @@ public class HiveInterpreter extends Interpreter {
   public HiveInterpreter(Properties property) {
     super(property);
     propertiesMap = new HashMap<>();
-    keyConnectionMap = new HashMap<>();
+    propertyKeyUnusedConnectionListMap = new HashMap<>();
     paragraphIdStatementMap = new HashMap<>();
+    paragraphIdConnectionMap = new HashMap<>();
   }
 
   public HashMap<String, Properties> getPropertiesMap() {
@@ -142,15 +146,22 @@ public class HiveInterpreter extends Interpreter {
   @Override
   public void close() {
     try {
+      for (List<Connection> connectionList : propertyKeyUnusedConnectionListMap.values()) {
+        for (Connection c : connectionList) {
+          c.close();
+        }
+      }
+
       for (Statement statement : paragraphIdStatementMap.values()) {
         statement.close();
       }
       paragraphIdStatementMap.clear();
 
-      for (Connection connection : keyConnectionMap.values()) {
+      for (Connection connection : paragraphIdConnectionMap.values()) {
         connection.close();
       }
-      keyConnectionMap.clear();
+      paragraphIdConnectionMap.clear();
+
     } catch (SQLException e) {
       logger.error("Error while closing...", e);
     }
@@ -158,12 +169,17 @@ public class HiveInterpreter extends Interpreter {
 
   public Connection getConnection(String propertyKey) throws ClassNotFoundException, SQLException {
     Connection connection = null;
-    if (keyConnectionMap.containsKey(propertyKey)) {
-      connection = keyConnectionMap.get(propertyKey);
-      if (connection.isClosed() || !connection.isValid(10)) {
-        connection.close();
-        connection = null;
-        keyConnectionMap.remove(propertyKey);
+    if (propertyKey == null || propertiesMap.get(propertyKey) == null) {
+      return null;
+    }
+    if (propertyKeyUnusedConnectionListMap.containsKey(propertyKey)) {
+      ArrayList<Connection> connectionList = propertyKeyUnusedConnectionListMap.get(propertyKey);
+      if (0 != connectionList.size()) {
+        connection = propertyKeyUnusedConnectionListMap.get(propertyKey).remove(0);
+        if (null != connection && connection.isClosed()) {
+          connection.close();
+          connection = null;
+        }
       }
     }
     if (null == connection) {
@@ -177,26 +193,42 @@ public class HiveInterpreter extends Interpreter {
       } else {
         connection = DriverManager.getConnection(url, properties);
       }
-      keyConnectionMap.put(propertyKey, connection);
     }
     return connection;
   }
 
   public Statement getStatement(String propertyKey, String paragraphId)
       throws SQLException, ClassNotFoundException {
-    Statement statement = null;
-    if (paragraphIdStatementMap.containsKey(paragraphId)) {
-      statement = paragraphIdStatementMap.get(paragraphId);
-      if (statement.isClosed()) {
-        statement = null;
-        paragraphIdStatementMap.remove(paragraphId);
-      }
+    Connection connection;
+    if (paragraphIdConnectionMap.containsKey(paragraphId)) {
+      // Never enter for now.
+      connection = paragraphIdConnectionMap.get(paragraphId);
+    } else {
+      connection = getConnection(propertyKey);
     }
-    if (null == statement) {
-      statement = getConnection(propertyKey).createStatement();
-      paragraphIdStatementMap.put(paragraphId, statement);
+    
+    if (connection == null) {
+      return null;
     }
+
+    Statement statement = connection.createStatement();
+    if (isStatementClosed(statement)) {
+      connection = getConnection(propertyKey);
+      statement = connection.createStatement();
+    }
+    paragraphIdConnectionMap.put(paragraphId, connection);
+    paragraphIdStatementMap.put(paragraphId, statement);
+
     return statement;
+  }
+
+  private boolean isStatementClosed(Statement statement) {
+    try {
+      return statement.isClosed();
+    } catch (Throwable t) {
+      logger.debug("{} doesn't support isClosed method", statement);
+      return false;
+    }
   }
 
   public InterpreterResult executeSql(String propertyKey, String sql,
@@ -206,6 +238,10 @@ public class HiveInterpreter extends Interpreter {
     try {
 
       Statement statement = getStatement(propertyKey, paragraphId);
+
+      if (statement == null) {
+        return new InterpreterResult(Code.ERROR, "Prefix not found.");
+      }
 
       statement.setMaxRows(getMaxResult());
 
@@ -259,7 +295,7 @@ public class HiveInterpreter extends Interpreter {
           }
           statement.close();
         } finally {
-          removeStatement(paragraphId);
+          moveConnectionToUnused(propertyKey, paragraphId);
         }
       }
 
@@ -271,18 +307,27 @@ public class HiveInterpreter extends Interpreter {
     }
   }
 
-  private void removeStatement(String paragraphId) {
-    paragraphIdStatementMap.remove(paragraphId);
+  private void moveConnectionToUnused(String propertyKey, String paragraphId) {
+    if (paragraphIdConnectionMap.containsKey(paragraphId)) {
+      Connection connection = paragraphIdConnectionMap.remove(paragraphId);
+      if (null != connection) {
+        if (propertyKeyUnusedConnectionListMap.containsKey(propertyKey)) {
+          propertyKeyUnusedConnectionListMap.get(propertyKey).add(connection);
+        } else {
+          ArrayList<Connection> connectionList = new ArrayList<>();
+          connectionList.add(connection);
+          propertyKeyUnusedConnectionListMap.put(propertyKey, connectionList);
+        }
+      }
+    }
   }
 
   @Override
   public InterpreterResult interpret(String cmd, InterpreterContext contextInterpreter) {
     String propertyKey = getPropertyKey(cmd);
 
-    if (null != propertyKey) {
+    if (null != propertyKey && !propertyKey.equals(DEFAULT_KEY)) {
       cmd = cmd.substring(propertyKey.length() + 2);
-    } else {
-      propertyKey = DEFAULT_KEY;
     }
 
     cmd = cmd.trim();
@@ -298,17 +343,19 @@ public class HiveInterpreter extends Interpreter {
   }
 
   public String getPropertyKey(String cmd) {
-    int firstLineIndex = cmd.indexOf("\n");
-    if (-1 == firstLineIndex) {
-      firstLineIndex = cmd.length();
+    boolean firstLineIndex = cmd.startsWith("(");
+
+    if (firstLineIndex) {
+      int configStartIndex = cmd.indexOf("(");
+      int configLastIndex = cmd.indexOf(")");
+      if (configStartIndex != -1 && configLastIndex != -1) {
+        return cmd.substring(configStartIndex + 1, configLastIndex);
+      } else {
+        return null;
+      }
+    } else {
+      return DEFAULT_KEY;
     }
-    int configStartIndex = cmd.indexOf("(");
-    int configLastIndex = cmd.indexOf(")");
-    if (configStartIndex != -1 && configLastIndex != -1
-        && configLastIndex < firstLineIndex && configLastIndex < firstLineIndex) {
-      return cmd.substring(configStartIndex + 1, configLastIndex);
-    }
-    return null;
   }
 
   @Override

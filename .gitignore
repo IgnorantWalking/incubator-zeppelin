@@ -8,12 +8,23 @@
 # interpreter
 /interpreter/
 
+# interpreter temp files
+spark/derby.log
+spark/metastore_db
+spark-1.*-bin-hadoop*
+.spark-dist
+zeppelin-server/derby.log
+
+lens/lens-cli-hist.log
+
 # conf file
 conf/zeppelin-env.sh
+conf/zeppelin-env.cmd
 conf/zeppelin-site.xml
 conf/keystore
 conf/truststore
 conf/interpreter.json
+conf/notebook-authorization.json
 
 # other generated files
 spark/dependency-reduced-pom.xml
@@ -45,6 +56,7 @@ zeppelin-web/bower_components
 **/data/
 **/build/
 **/testing/
+!/testing/
 
 # OS generated files #
 ######################

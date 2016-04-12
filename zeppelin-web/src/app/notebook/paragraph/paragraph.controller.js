@@ -16,11 +16,67 @@
 
 angular.module('zeppelinWebApp')
   .controller('ParagraphCtrl', function($scope,$rootScope, $route, $window, $element, $routeParams, $location,
-                                         $timeout, $compile, websocketMsgSrv) {
-
+                                         $timeout, $compile, websocketMsgSrv, ngToast) {
+  var ANGULAR_FUNCTION_OBJECT_NAME_PREFIX = '_Z_ANGULAR_FUNC_';
+  $scope.parentNote = null;
   $scope.paragraph = null;
   $scope.originalText = '';
   $scope.editor = null;
+
+  var paragraphScope = $rootScope.$new(true, $rootScope);
+
+  // to keep backward compatibility
+  $scope.compiledScope = paragraphScope;
+
+  paragraphScope.z = {
+    // z.runParagraph('20150213-231621_168813393')
+    runParagraph: function(paragraphId) {
+      if (paragraphId) {
+        var filtered = $scope.parentNote.paragraphs.filter(function(x) {
+          return x.id === paragraphId;});
+        if (filtered.length === 1) {
+          var paragraph = filtered[0];
+          websocketMsgSrv.runParagraph(paragraph.id, paragraph.title, paragraph.text,
+              paragraph.config, paragraph.settings.params);
+        } else {
+          ngToast.danger({content: 'Cannot find a paragraph with id \'' + paragraphId + '\'',
+            verticalPosition: 'top', dismissOnTimeout: false});
+        }
+      } else {
+        ngToast.danger({
+          content: 'Please provide a \'paragraphId\' when calling z.runParagraph(paragraphId)',
+          verticalPosition: 'top', dismissOnTimeout: false});
+      }
+    },
+
+    // Example: z.angularBind('my_var', 'Test Value', '20150213-231621_168813393')
+    angularBind: function(varName, value, paragraphId) {
+      // Only push to server if there paragraphId is defined
+      if (paragraphId) {
+        websocketMsgSrv.clientBindAngularObject($routeParams.noteId, varName, value, paragraphId);
+      } else {
+        ngToast.danger({
+          content: 'Please provide a \'paragraphId\' when calling ' +
+          'z.angularBind(varName, value, \'PUT_HERE_PARAGRAPH_ID\')',
+          verticalPosition: 'top', dismissOnTimeout: false});
+      }
+    },
+
+    // Example: z.angularUnBind('my_var', '20150213-231621_168813393')
+    angularUnbind: function(varName, paragraphId) {
+      // Only push to server if paragraphId is defined
+      if (paragraphId) {
+        websocketMsgSrv.clientUnbindAngularObject($routeParams.noteId, varName, paragraphId);
+      } else {
+        ngToast.danger({
+          content: 'Please provide a \'paragraphId\' when calling ' +
+          'z.angularUnbind(varName, \'PUT_HERE_PARAGRAPH_ID\')',
+          verticalPosition: 'top', dismissOnTimeout: false});
+      }
+    }
+  };
+
+  var angularObjectRegistry = {};
 
   var editorModes = {
     'ace/mode/scala': /^%spark/,
@@ -30,13 +86,17 @@ angular.module('zeppelinWebApp')
   };
 
   // Controller init
-  $scope.init = function(newParagraph) {
+  $scope.init = function(newParagraph, note) {
     $scope.paragraph = newParagraph;
+    $scope.parentNote = note;
     $scope.originalText = angular.copy(newParagraph.text);
     $scope.chart = {};
     $scope.colWidthOption = [ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 ];
     $scope.showTitleEditor = false;
     $scope.paragraphFocused = false;
+    if (newParagraph.focus) {
+      $scope.paragraphFocused = true;
+    }
 
     if (!$scope.paragraph.config) {
       $scope.paragraph.config = {};
@@ -51,11 +111,13 @@ angular.module('zeppelinWebApp')
       $scope.renderHtml();
     } else if ($scope.getResultType() === 'ANGULAR') {
       $scope.renderAngular();
+    } else if ($scope.getResultType() === 'TEXT') {
+      $scope.renderText();
     }
   };
 
-  $scope.renderHtml = function() {
-    var retryRenderer = function() {
+    $scope.renderHtml = function() {
+      var retryRenderer = function() {
       if (angular.element('#p' + $scope.paragraph.id + '_html').length) {
         try {
           angular.element('#p' + $scope.paragraph.id + '_html').html($scope.paragraph.result.msg);
@@ -67,10 +129,10 @@ angular.module('zeppelinWebApp')
           console.log('HTML rendering error %o', err);
         }
       } else {
+        $timeout(retryRenderer, 10);
       }
     };
     $timeout(retryRenderer);
-
   };
 
   $scope.renderAngular = function() {
@@ -79,18 +141,141 @@ angular.module('zeppelinWebApp')
         try {
           angular.element('#p'+$scope.paragraph.id+'_angular').html($scope.paragraph.result.msg);
 
-          $compile(angular.element('#p'+$scope.paragraph.id+'_angular').contents())($rootScope.compiledScope);
+          $compile(angular.element('#p'+$scope.paragraph.id+'_angular').contents())(paragraphScope);
         } catch(err) {
           console.log('ANGULAR rendering error %o', err);
         }
       } else {
-        $timeout(retryRenderer,10);
+        $timeout(retryRenderer, 10);
       }
     };
     $timeout(retryRenderer);
-
   };
 
+  $scope.renderText = function() {
+    var retryRenderer = function() {
+
+      var textEl = angular.element('#p' + $scope.paragraph.id + '_text');
+      if (textEl.length) {
+        // clear all lines before render
+        $scope.clearTextOutput();
+
+        if ($scope.paragraph.result && $scope.paragraph.result.msg) {
+          $scope.appendTextOutput($scope.paragraph.result.msg);
+        }
+
+        angular.element('#p' + $scope.paragraph.id + '_text').bind('mousewheel', function(e) {
+          $scope.keepScrollDown = false;
+        });
+        $scope.flushStreamingOutput = true;
+      } else {
+        $timeout(retryRenderer, 10);
+      }
+    };
+    $timeout(retryRenderer);
+  };
+
+  $scope.clearTextOutput = function() {
+    var textEl = angular.element('#p' + $scope.paragraph.id + '_text');
+    if (textEl.length) {
+      textEl.children().remove();
+    }
+  };
+
+  $scope.appendTextOutput = function(msg) {
+    var textEl = angular.element('#p' + $scope.paragraph.id + '_text');
+    if (textEl.length) {
+      var lines = msg.split('\n');
+      for (var i=0; i < lines.length; i++) {
+        textEl.append(angular.element('<div></div>').text(lines[i]));
+      }
+    }
+    if ($scope.keepScrollDown) {
+      var doc = angular.element('#p' + $scope.paragraph.id + '_text');
+      doc[0].scrollTop = doc[0].scrollHeight;
+    }
+  };
+
+
+
+  $scope.$on('angularObjectUpdate', function(event, data) {
+    var noteId = $route.current.pathParams.noteId;
+    if (!data.noteId || (data.noteId === noteId && (!data.paragraphId || data.paragraphId === $scope.paragraph.id))) {
+      var scope = paragraphScope;
+      var varName = data.angularObject.name;
+
+      if (angular.equals(data.angularObject.object, scope[varName])) {
+        // return when update has no change
+        return;
+      }
+
+      if (!angularObjectRegistry[varName]) {
+        angularObjectRegistry[varName] = {
+          interpreterGroupId : data.interpreterGroupId,
+          noteId : data.noteId,
+          paragraphId : data.paragraphId
+        };
+      } else {
+        angularObjectRegistry[varName].noteId = angularObjectRegistry[varName].noteId || data.noteId;
+        angularObjectRegistry[varName].paragraphId = angularObjectRegistry[varName].paragraphId || data.paragraphId;
+      }
+
+      angularObjectRegistry[varName].skipEmit = true;
+
+      if (!angularObjectRegistry[varName].clearWatcher) {
+        angularObjectRegistry[varName].clearWatcher = scope.$watch(varName, function(newValue, oldValue) {
+          console.log('angular object (paragraph) updated %o %o', varName, angularObjectRegistry[varName]);
+          if (angularObjectRegistry[varName].skipEmit) {
+            angularObjectRegistry[varName].skipEmit = false;
+            return;
+          }
+          websocketMsgSrv.updateAngularObject(
+            angularObjectRegistry[varName].noteId,
+            angularObjectRegistry[varName].paragraphId,
+            varName,
+            newValue,
+            angularObjectRegistry[varName].interpreterGroupId);
+        });
+      }
+      console.log('angular object (paragraph) created %o', varName);
+      scope[varName] = data.angularObject.object;
+
+      // create proxy for AngularFunction
+      if (varName.startsWith(ANGULAR_FUNCTION_OBJECT_NAME_PREFIX)) {
+        var funcName = varName.substring((ANGULAR_FUNCTION_OBJECT_NAME_PREFIX).length);
+        scope[funcName] = function() {
+          scope[varName] = arguments;
+          console.log('angular function (paragraph) invoked %o', arguments);
+        };
+
+        console.log('angular function (paragraph) created %o', scope[funcName]);
+      }
+    }
+  });
+
+
+  $scope.$on('angularObjectRemove', function(event, data) {
+    var noteId = $route.current.pathParams.noteId;
+    if (!data.noteId || (data.noteId === noteId && (!data.paragraphId || data.paragraphId === $scope.paragraph.id))) {
+      var scope = paragraphScope;
+      var varName = data.name;
+
+      // clear watcher
+      if (angularObjectRegistry[varName]) {
+        angularObjectRegistry[varName].clearWatcher();
+        angularObjectRegistry[varName] = undefined;
+      }
+
+      // remove scope variable
+      scope[varName] = undefined;
+
+      // remove proxy for AngularFunction
+      if (varName.startsWith(ANGULAR_FUNCTION_OBJECT_NAME_PREFIX)) {
+        var funcName = varName.substring((ANGULAR_FUNCTION_OBJECT_NAME_PREFIX).length);
+        scope[funcName] = undefined;
+      }
+    }
+  });
 
   var initializeDefault = function() {
     var config = $scope.paragraph.config;
@@ -154,6 +339,10 @@ angular.module('zeppelinWebApp')
     }
   });
 
+  var isEmpty = function (object) {
+    return !object;
+  };
+
   // TODO: this may have impact on performance when there are many paragraphs in a note.
   $scope.$on('updateParagraph', function(event, data) {
     if (data.paragraph.id === $scope.paragraph.id &&
@@ -164,6 +353,7 @@ angular.module('zeppelinWebApp')
          data.paragraph.status !== $scope.paragraph.status ||
          data.paragraph.jobName !== $scope.paragraph.jobName ||
          data.paragraph.title !== $scope.paragraph.title ||
+         isEmpty(data.paragraph.result) !== isEmpty($scope.paragraph.result) ||
          data.paragraph.errorMessage !== $scope.paragraph.errorMessage ||
          !angular.equals(data.paragraph.settings, $scope.paragraph.settings) ||
          !angular.equals(data.paragraph.config, $scope.paragraph.config))
@@ -173,7 +363,8 @@ angular.module('zeppelinWebApp')
       var newType = $scope.getResultType(data.paragraph);
       var oldGraphMode = $scope.getGraphMode();
       var newGraphMode = $scope.getGraphMode(data.paragraph);
-      var resultRefreshed = (data.paragraph.dateFinished !== $scope.paragraph.dateFinished);
+      var resultRefreshed = (data.paragraph.dateFinished !== $scope.paragraph.dateFinished) || isEmpty(data.paragraph.result) !== isEmpty($scope.paragraph.result);
+
       var statusChanged = (data.paragraph.status !== $scope.paragraph.status);
 
       //console.log("updateParagraph oldData %o, newData %o. type %o -> %o, mode %o -> %o", $scope.paragraph, data, oldType, newType, oldGraphMode, newGraphMode);
@@ -232,6 +423,8 @@ angular.module('zeppelinWebApp')
         $scope.renderHtml();
       } else if (newType === 'ANGULAR' && resultRefreshed) {
         $scope.renderAngular();
+      } else if (newType === 'TEXT' && resultRefreshed) {
+        $scope.renderText();
       }
 
       if (statusChanged || resultRefreshed) {
@@ -245,8 +438,26 @@ angular.module('zeppelinWebApp')
           }, 500);
         }
       }
+
     }
 
+  });
+
+  $scope.$on('appendParagraphOutput', function(event, data) {
+    if ($scope.paragraph.id === data.paragraphId) {
+      if ($scope.flushStreamingOutput) {
+        $scope.clearTextOutput();
+        $scope.flushStreamingOutput = false;
+      }
+      $scope.appendTextOutput(data.data);
+    }
+  });
+
+  $scope.$on('updateParagraphOutput', function(event, data) {
+    if ($scope.paragraph.id === data.paragraphId) {
+      $scope.clearTextOutput();
+      $scope.appendTextOutput(data.data);
+    }
   });
 
   $scope.isRunning = function() {
@@ -285,6 +496,15 @@ angular.module('zeppelinWebApp')
     commitParagraph($scope.paragraph.title, $scope.paragraph.text, newConfig, newParams);
   };
 
+  $scope.run = function() {
+    var editorValue = $scope.editor.getValue();
+    if (editorValue) {
+      if (!($scope.paragraph.status === 'RUNNING' || $scope.paragraph.status === 'PENDING')) {
+        $scope.runParagraph(editorValue);
+      }
+    }
+  };
+
   $scope.moveUp = function() {
     $scope.$emit('moveParagraphUp', $scope.paragraph.id);
   };
@@ -299,6 +519,7 @@ angular.module('zeppelinWebApp')
 
   $scope.removeParagraph = function() {
     BootstrapDialog.confirm({
+      closable: true,
       title: '',
       message: 'Do you want to delete this paragraph?',
       callback: function(result) {
@@ -462,11 +683,16 @@ angular.module('zeppelinWebApp')
       value = params[formulaire.name];
     }
 
-    if (value === '') {
-      value = formulaire.options[0].value;
-    }
-
     $scope.paragraph.settings.params[formulaire.name] = value;
+  };
+
+  $scope.toggleCheckbox = function(formulaire, option) {
+    var idx = $scope.paragraph.settings.params[formulaire.name].indexOf(option.value);
+    if (idx > -1) {
+      $scope.paragraph.settings.params[formulaire.name].splice(idx, 1);
+    } else {
+      $scope.paragraph.settings.params[formulaire.name].push(option.value);
+    }
   };
 
   $scope.aceChanged = function() {
@@ -491,7 +717,9 @@ angular.module('zeppelinWebApp')
       $scope.editor.setHighlightGutterLine(false);
       $scope.editor.getSession().setUseWrapMode(true);
       $scope.editor.setTheme('ace/theme/chrome');
-      $scope.editor.focus();
+      if ($scope.paragraphFocused) {
+        $scope.editor.focus();
+      }
 
       autoAdjustEditorHeight(_editor.container.id);
       angular.element(window).resize(function() {
@@ -500,9 +728,11 @@ angular.module('zeppelinWebApp')
 
       if (navigator.appVersion.indexOf('Mac') !== -1 ) {
         $scope.editor.setKeyboardHandler('ace/keyboard/emacs');
+        $rootScope.isMac = true;
       } else if (navigator.appVersion.indexOf('Win') !== -1 ||
                  navigator.appVersion.indexOf('X11') !== -1 ||
                  navigator.appVersion.indexOf('Linux') !== -1) {
+        $rootScope.isMac = false;
         // not applying emacs key binding while the binding override Ctrl-v. default behavior of paste text on windows.
       }
 
@@ -540,35 +770,8 @@ angular.module('zeppelinWebApp')
 
           pos = session.getTextRange(new Range(0, 0, pos.row, pos.column)).length;
           var buf = session.getValue();
-          var completionString = buf;
 
-          if (pos > 0) {
-            var completionStartPosition = pos;
-            var completionSeqCharaters = [' ', '\n'];
-
-            // replace \r\n or \n\r other to \n
-            var reverseCompletionString = buf.replace(/\r?\n|\r/g, '\n').substr(0, pos).split('').reverse();
-            for (var seqCharacterIndex in completionSeqCharaters) {
-              var indexOfReverseSeqPostion = reverseCompletionString.indexOf(completionSeqCharaters[seqCharacterIndex]);
-
-              if (indexOfReverseSeqPostion < completionStartPosition && indexOfReverseSeqPostion > 0) {
-                completionStartPosition = indexOfReverseSeqPostion;
-              }
-            }
-
-            if (completionStartPosition === pos) {
-              completionStartPosition = 0;
-            }
-            else
-            {
-              completionStartPosition = pos - completionStartPosition;
-            }
-
-            completionString = buf.substr( completionStartPosition , pos);
-            pos = completionString.length -1;
-          }
-
-          websocketMsgSrv.completion($scope.paragraph.id, completionString, pos);
+          websocketMsgSrv.completion($scope.paragraph.id, buf, pos);
 
           $scope.$on('completionList', function(event, data) {
             if (data.completions) {
@@ -618,19 +821,6 @@ angular.module('zeppelinWebApp')
 
       $scope.setParagraphMode($scope.editor.getSession(), $scope.editor.getSession().getValue());
 
-      $scope.editor.commands.addCommand({
-        name: 'run',
-        bindKey: {win: 'Shift-Enter', mac: 'Shift-Enter'},
-        exec: function(editor) {
-          var editorValue = editor.getValue();
-          if (editorValue) {
-            if (!($scope.paragraph.status === 'RUNNING' || $scope.paragraph.status === 'PENDING')) {
-              $scope.runParagraph(editorValue);
-            }
-          }
-        },
-        readOnly: false
-      });
 
       // autocomplete on '.'
       /*
@@ -643,6 +833,10 @@ angular.module('zeppelinWebApp')
     }
       });
       */
+
+      // remove binding
+      $scope.editor.commands.bindKey('ctrl-alt-n.', null);
+
 
       // autocomplete on 'ctrl+.'
       $scope.editor.commands.bindKey('ctrl-.', 'startAutocomplete');
@@ -663,7 +857,7 @@ angular.module('zeppelinWebApp')
           var numRows;
           var currentRow;
 
-          if (keyCode === 38 || (keyCode === 80 && e.ctrlKey)) {  // UP
+          if (keyCode === 38 || (keyCode === 80 && e.ctrlKey && !e.altKey)) {  // UP
             numRows = $scope.editor.getSession().getLength();
             currentRow = $scope.editor.getCursorPosition().row;
             if (currentRow === 0) {
@@ -672,7 +866,7 @@ angular.module('zeppelinWebApp')
             } else {
               $scope.scrollToCursor($scope.paragraph.id, -1);
             }
-          } else if (keyCode === 40 || (keyCode === 78 && e.ctrlKey)) {  // DOWN
+          } else if (keyCode === 40 || (keyCode === 78 && e.ctrlKey && !e.altKey)) {  // DOWN
             numRows = $scope.editor.getSession().getLength();
             currentRow = $scope.editor.getCursorPosition().row;
             if (currentRow === numRows-1) {
@@ -793,21 +987,103 @@ angular.module('zeppelinWebApp')
     }
   });
 
-  $scope.$on('focusParagraph', function(event, paragraphId, cursorPos) {
+  $scope.$on('keyEvent', function(event, keyEvent) {
+    if ($scope.paragraphFocused) {
+
+      var paragraphId = $scope.paragraph.id;
+      var keyCode = keyEvent.keyCode;
+      var noShortcutDefined = false;
+      var editorHide = $scope.paragraph.config.editorHide;
+
+      if (editorHide && (keyCode === 38 || (keyCode === 80 && keyEvent.ctrlKey && !keyEvent.altKey))) { // up
+        // move focus to previous paragraph
+        $scope.$emit('moveFocusToPreviousParagraph', paragraphId);
+      } else if (editorHide && (keyCode === 40 || (keyCode === 78 && keyEvent.ctrlKey && !keyEvent.altKey))) { // down
+        // move focus to next paragraph
+        $scope.$emit('moveFocusToNextParagraph', paragraphId);
+      } else if (keyEvent.shiftKey && keyCode === 13) { // Shift + Enter
+        $scope.run();
+      } else if (keyEvent.ctrlKey && keyEvent.altKey && keyCode === 67) { // Ctrl + Alt + c
+        $scope.cancelParagraph();
+      } else if (keyEvent.ctrlKey && keyEvent.altKey && keyCode === 68) { // Ctrl + Alt + d
+        $scope.removeParagraph();
+      } else if (keyEvent.ctrlKey && keyEvent.altKey && keyCode === 75) { // Ctrl + Alt + k
+        $scope.moveUp();
+      } else if (keyEvent.ctrlKey && keyEvent.altKey && keyCode === 74) { // Ctrl + Alt + j
+        $scope.moveDown();
+      } else if (keyEvent.ctrlKey && keyEvent.altKey && keyCode === 65) { // Ctrl + Alt + a
+        $scope.insertNew('above');
+      } else if (keyEvent.ctrlKey && keyEvent.altKey && keyCode === 66) { // Ctrl + Alt + b
+        $scope.insertNew('below');
+      } else if (keyEvent.ctrlKey && keyEvent.altKey && keyCode === 79) { // Ctrl + Alt + o
+        $scope.toggleOutput();
+      } else if (keyEvent.ctrlKey && keyEvent.altKey && keyCode === 82) { // Ctrl + Alt + r
+        $scope.toggleEnableDisable();
+      } else if (keyEvent.ctrlKey && keyEvent.altKey && keyCode === 69) { // Ctrl + Alt + e
+        $scope.toggleEditor();
+      } else if (keyEvent.ctrlKey && keyEvent.altKey && keyCode === 77) { // Ctrl + Alt + m
+        if ($scope.paragraph.config.lineNumbers) {
+          $scope.hideLineNumbers();
+        } else {
+          $scope.showLineNumbers();
+        }
+      } else if (keyEvent.ctrlKey && keyEvent.shiftKey && keyCode === 189) { // Ctrl + Shift + -
+        $scope.paragraph.config.colWidth = Math.max(1, $scope.paragraph.config.colWidth - 1);
+        $scope.changeColWidth();
+      } else if (keyEvent.ctrlKey && keyEvent.shiftKey && keyCode === 187) { // Ctrl + Shift + =
+        $scope.paragraph.config.colWidth = Math.min(12, $scope.paragraph.config.colWidth + 1);
+        $scope.changeColWidth();
+      } else if (keyEvent.ctrlKey && keyEvent.altKey && ((keyCode >= 48 && keyCode <=57) || keyCode === 189 || keyCode === 187)) { // Ctrl + Alt + [1~9,0,-,=]
+        var colWidth = 12;
+        if (keyCode === 48) {
+          colWidth = 10;
+        } else if (keyCode === 189) {
+          colWidth = 11;
+        } else if (keyCode === 187) {
+          colWidth = 12;
+        } else {
+          colWidth = keyCode - 48;
+        }
+        $scope.paragraph.config.colWidth = colWidth;
+        $scope.changeColWidth();
+      } else if (keyEvent.ctrlKey && keyEvent.altKey && keyCode === 84) { // Ctrl + Alt + t
+        if ($scope.paragraph.config.title) {
+          $scope.hideTitle();
+        } else {
+          $scope.showTitle();
+        }
+      } else {
+        noShortcutDefined = true;
+      }
+
+      if (!noShortcutDefined) {
+        keyEvent.preventDefault();
+      }
+    }
+  });
+
+  $scope.$on('focusParagraph', function(event, paragraphId, cursorPos, mouseEvent) {
     if ($scope.paragraph.id === paragraphId) {
       // focus editor
-      $scope.editor.focus();
-
-      // move cursor to the first row (or the last row)
-      var row;
-      if (cursorPos >= 0) {
-        row = cursorPos;
-        $scope.editor.gotoLine(row, 0);
-      } else {
-        row = $scope.editor.session.getLength();
-        $scope.editor.gotoLine(row, 0);
+      if (!$scope.paragraph.config.editorHide) {
+        if (!mouseEvent) {
+          $scope.editor.focus();
+          // move cursor to the first row (or the last row)
+          var row;
+          if (cursorPos >= 0) {
+            row = cursorPos;
+            $scope.editor.gotoLine(row, 0);
+          } else {
+            row = $scope.editor.session.getLength();
+            $scope.editor.gotoLine(row, 0);
+          }
+          $scope.scrollToCursor($scope.paragraph.id, 0);
+        }
       }
-      $scope.scrollToCursor($scope.paragraph.id, 0);
+      $scope.handleFocus(true);
+    } else {
+      $scope.editor.blur();
+      $scope.handleFocus(false);
     }
   });
 
@@ -972,12 +1248,12 @@ angular.module('zeppelinWebApp')
       html += '<table class="table table-hover table-condensed">';
       html += '  <thead>';
       html += '    <tr style="background-color: #F6F6F6; font-weight: bold;">';
-      for (var c in $scope.paragraph.result.columnNames) {
-        html += '<th>'+$scope.paragraph.result.columnNames[c].name+'</th>';
+      for (var titleIndex in $scope.paragraph.result.columnNames) {
+        html += '<th>'+$scope.paragraph.result.columnNames[titleIndex].name+'</th>';
       }
       html += '    </tr>';
       html += '  </thead>';
-
+      html += '  <tbody>';
       for (var r in $scope.paragraph.result.msgTable) {
         var row = $scope.paragraph.result.msgTable[r];
         html += '    <tr>';
@@ -992,19 +1268,38 @@ angular.module('zeppelinWebApp')
         }
         html += '    </tr>';
       }
-
+      html += '  </tbody>';
       html += '</table>';
 
       angular.element('#p' + $scope.paragraph.id + '_table').html(html);
       if ($scope.paragraph.result.msgTable.length > 10000) {
         angular.element('#p' + $scope.paragraph.id + '_table').css('overflow', 'scroll');
+        // set table height
+        var height = $scope.paragraph.config.graph.height;
+        angular.element('#p' + $scope.paragraph.id + '_table').css('height', height);
       } else {
+        var dataTable = angular.element('#p' + $scope.paragraph.id + '_table .table');
+        dataTable.floatThead({
+          scrollContainer: function (dataTable) {
+            return angular.element('#p' + $scope.paragraph.id + '_table');
+          }
+        });
+        angular.element('#p' + $scope.paragraph.id + '_table .table').on('remove', function () {
+          angular.element('#p' + $scope.paragraph.id + '_table .table').floatThead('destroy');
+        });
+
+        angular.element('#p' + $scope.paragraph.id + '_table').css('position', 'relative');
+        angular.element('#p' + $scope.paragraph.id + '_table').css('height', '100%');
+        angular.element('#p' + $scope.paragraph.id + '_table').perfectScrollbar('destroy');
         angular.element('#p' + $scope.paragraph.id + '_table').perfectScrollbar();
+        angular.element('.ps-scrollbar-y-rail').css('z-index', '1002');
+
+        // set table height
+        var psHeight = $scope.paragraph.config.graph.height;
+        angular.element('#p' + $scope.paragraph.id + '_table').css('height', psHeight);
+        angular.element('#p' + $scope.paragraph.id + '_table').perfectScrollbar('update');
       }
 
-      // set table height
-      var height = $scope.paragraph.config.graph.height;
-      angular.element('#p' + $scope.paragraph.id + '_table').height(height);
     };
 
     var retryRenderer = function() {
@@ -1022,7 +1317,9 @@ angular.module('zeppelinWebApp')
 
   };
 
-  var integerFormatter = d3.format(',.1d');
+  var groupedThousandsWith3DigitsFormatter = function(x){
+    return d3.format(',')(d3.round(x, 3));
+  };
 
   var customAbbrevFormatter = function(x) {
     var s = d3.format('.3s')(x);
@@ -1044,7 +1341,7 @@ angular.module('zeppelinWebApp')
     if(d >= Math.pow(10,6)){
       return customAbbrevFormatter(d);
     }
-    return integerFormatter(d);
+    return groupedThousandsWith3DigitsFormatter(d);
   };
 
   var setD3Chart = function(type, data, refresh) {
@@ -1068,7 +1365,7 @@ angular.module('zeppelinWebApp')
       $scope.chart[type].yAxis.tickFormat(function(d) {return xAxisTickFormat(d, yLabels);});
 
       // configure how the tooltip looks.
-      $scope.chart[type].tooltipContent(function(key, x, y, data) {
+      $scope.chart[type].tooltipContent(function(key, x, y, graph, data) {
         var tooltipContent = '<h3>' + key + '</h3>';
         if ($scope.paragraph.config.graph.scatter.size &&
             $scope.isValidSizeOption($scope.paragraph.config.graph.scatter, $scope.paragraph.result.rows)) {
@@ -1079,9 +1376,8 @@ angular.module('zeppelinWebApp')
       });
 
       $scope.chart[type].showDistX(true)
-        .showDistY(true)
+        .showDistY(true);
       //handle the problem of tooltip not showing when muliple points have same value.
-        .scatter.useVoronoi(false);
     } else {
       var p = pivot(data);
       if (type === 'pieChart') {
@@ -1824,9 +2120,22 @@ angular.module('zeppelinWebApp')
     return true;
   };
 
-  $scope.setGraphHeight = function() {
-    var height = angular.element('#p' + $scope.paragraph.id + '_graph').height();
+  $scope.resizeParagraph = function(width, height) {
+    if ($scope.paragraph.config.colWidth !== width) {
 
+        $scope.paragraph.config.colWidth = width;
+        $scope.changeColWidth();
+        $timeout(function() {
+          autoAdjustEditorHeight($scope.paragraph.id + '_editor');
+          $scope.changeHeight(height);
+        }, 200);
+
+    } else {
+      $scope.changeHeight(height);
+    }
+  };
+
+  $scope.changeHeight = function(height) {
     var newParams = angular.copy($scope.paragraph.settings.params);
     var newConfig = angular.copy($scope.paragraph.config);
 
@@ -1847,4 +2156,33 @@ angular.module('zeppelinWebApp')
     var redirectToUrl = location.protocol + '//' + location.host + location.pathname + '#/notebook/' + noteId + '/paragraph/' + $scope.paragraph.id+'?asIframe';
     $window.open(redirectToUrl);
   };
+
+  $scope.showScrollDownIcon = function(){
+    var doc = angular.element('#p' + $scope.paragraph.id + '_text');
+    if(doc[0]){
+      return doc[0].scrollHeight > doc.innerHeight();
+    }
+    return false;
+  };
+
+  $scope.scrollParagraphDown = function() {
+    var doc = angular.element('#p' + $scope.paragraph.id + '_text');
+    doc.animate({scrollTop: doc[0].scrollHeight}, 500);
+    $scope.keepScrollDown = true;
+  };
+
+  $scope.showScrollUpIcon = function(){
+    if(angular.element('#p' + $scope.paragraph.id + '_text')[0]){
+      return angular.element('#p' + $scope.paragraph.id + '_text')[0].scrollTop !== 0;
+    }
+    return false;
+
+  };
+
+  $scope.scrollParagraphUp = function() {
+    var doc = angular.element('#p' + $scope.paragraph.id + '_text');
+    doc.animate({scrollTop: 0}, 500);
+    $scope.keepScrollDown = false;
+  };
+
 });
